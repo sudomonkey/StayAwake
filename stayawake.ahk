@@ -21,11 +21,11 @@ global CLR_BTN_FILL   := 0x1C1C1C
 global CLR_BTN_BORDER := 0x5A5A5A
 global CLR_ACC_FILL   := 0x2F6FED
 
-global CLR_TEXT     := 0xF2F2F2
+global CLR_TEXT     := 0xE0E0E0
 global CLR_BTN_TEXT := 0xFFFFFF
 global CLR_TEXT_ACC := 0xFFFFFF
 
-global TXT_BODY := "cF2F2F2"
+global TXT_BODY := "cE0E0E0"
 global TXT_OK   := "c5FE88A"
 global TXT_WARN := "cFF8080"
 global TXT_GHOST := "c5A5A5A"
@@ -49,7 +49,7 @@ BgOpt(clr) {
 
 
 ; ===== MODULE: APP STATE GLOBALS ============================
-global APP_VERSION := "8.8"
+global APP_VERSION := "8.9"
 
 global timerIntervalMinutes := 5
 global isPaused := false
@@ -450,7 +450,7 @@ EnsureCustomCodeFile() {
     global customCodePath
     if (FileExist(customCodePath))
         return true
-    local template := "#Requires AutoHotkey v2.0`n#SingleInstance Force`n#NoTrayIcon`n`n; ============================================================`n; StayAwake - Custom Code`n; ============================================================`n; This file runs alongside StayAwake. Put your own hotkeys,`n; hotstrings and functions here.`n;`n; Requires AutoHotkey v2.0 to be installed on this machine.`n;`n; After editing, use the tray menu:`n;     Custom Code > Reload Custom Code`n;`n; Do NOT remove the #SingleInstance Force line above -- it is`n; what prevents duplicate copies from running.`n; ============================================================`n`n`n; ---- Example: Ctrl+Shift+F12 sends Ctrl+Alt+A --------------`n; ^+F12::`n; {`n;     Sleep(150)`n;     Send(`"^!a`")`n; }`n`n`n; ---- Example: Ctrl+Alt+Shift+PageDown types today's date ----`n; ^!+PgDn::`n; {`n;     currentDate := FormatTime(, `"yyyy.MM.dd`")`n;     SendText(currentDate `" - `")`n; }`n`n`n; ---- Your code below ---------------------------------------`n"
+    local template := "#Requires AutoHotkey v2.0`n#SingleInstance Force`n#NoTrayIcon`n`n; ============================================================`n; StayAwake - Custom Code`n; ============================================================`n; This file runs alongside StayAwake. Put your own hotkeys,`n; hotstrings, and functions here.`n;`n; --- IMPORTANT RULES ---`n; 1. AutoHotkey v2.0 MUST be installed on this machine.`n; 2. Do NOT remove the #Requires or #SingleInstance lines above.`n; 3. After editing, apply your changes via the StayAwake menu:`n;    Custom Code > Reload Custom Code`n;`n; --- HOW TO READ & WRITE A HOTKEY ---`n;`n; ^+Home::                   <- 1. The keys to press (Ctrl+Shift+Home), ending in ::`n; {                          <- 2. Open bracket to start the action`n;     Run(`"notepad.exe`")     <- 3. The command you want to happen`n; }                          <- 4. Close bracket to end the action`n;`n; Full official guide for hotkeys:`n; https://www.autohotkey.com/docs/v2/Hotkeys.htm`n;`n; ============================================================`n; YOUR CODE BELOW`n; ============================================================`n`n"
     try {
         FileAppend(template, customCodePath, "UTF-8")
         return true
@@ -1099,7 +1099,7 @@ ShowCustomTooltip(msg, state := "active", duration := 2000) {
         try tooltipGui.Destroy()
     tooltipGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20", "Notification")
     tooltipGui.BackColor := 0x181818
-    tooltipGui.SetFont("s11 w400 cF2F2F2", "Segoe UI")
+    tooltipGui.SetFont("s11 w500 " TXT_BODY, UI_FONT)
     tooltipGui.MarginX := 20, tooltipGui.MarginY := 16
     tooltipGui.AddPicture("w32 h32 Icon105", "imageres.dll")
     tooltipGui.AddText("x+12 yp+6 w360", msg)
@@ -1139,7 +1139,7 @@ CreateCustomMenu() {
     global g_PowerExpanded, g_CustomExpanded, g_MenuIsRefreshing
     global g_LockedWinX, g_LockedBottomY, g_HoveredRowObj
     global g_shutdownPending
-    global UI_FONT, CLR_BG, CLR_DIVIDER, TXT_BODY, TXT_WARN, TXT_OK, TXT_GHOST
+    global UI_FONT, CLR_BG, CLR_FOOTER, CLR_DIVIDER, TXT_BODY, TXT_WARN, TXT_OK, TXT_GHOST
     
     if (IsObject(g_MnuMain)) {
         SetTimer(MenuTrackerLoop, 0)
@@ -1154,21 +1154,21 @@ CreateCustomMenu() {
     
     local w := 220, y := 4
     
-    AddRow := (txt, cb, triggerType := "", specialStyle := "", isIndented := false) => (
-        g_MnuMain.SetFont("q3 " (specialStyle ? specialStyle : "s10 w400 " TXT_BODY), UI_FONT),
+    AddRow := (txt, cb, triggerType := "", specialStyle := "", isIndented := false, rowBg := CLR_BG) => (
+        g_MnuMain.SetFont("q4 " (specialStyle ? specialStyle : "s10 w400 " TXT_BODY), UI_FONT),
         lblText := (isIndented ? "        " : "   ") txt,
         
         wMain := (triggerType != "") ? (w - 32) : (w - 4),
-        ctrl := g_MnuMain.AddText("x2 y" y " w" wMain " h28 +0x200 +0x100 " BgOpt(CLR_BG), lblText),
+        ctrl := g_MnuMain.AddText("x2 y" y " w" wMain " h28 +0x200 +0x100 " BgOpt(rowBg), lblText),
         
         arr := 0,
         (triggerType != "") ? (
             arrowTxt := (triggerType == "power") ? (g_PowerExpanded ? "▼" : "▶") : (g_CustomExpanded ? "▼" : "▶"),
-            g_MnuMain.SetFont("q3 s9 w400 c8A8A8A", UI_FONT),
-            arr := g_MnuMain.AddText("x" (w - 32) " y" y " w28 h28 +0x200 +0x100 Right " BgOpt(CLR_BG), arrowTxt "  ")
+            g_MnuMain.SetFont("q4 s9 w400 c8A8A8A", UI_FONT),
+            arr := g_MnuMain.AddText("x" (w - 32) " y" y " w28 h28 +0x200 +0x100 Right " BgOpt(rowBg), arrowTxt "  ")
         ) : "",
         
-        g_MainRows.Push({ hwnd: ctrl.Hwnd, hwndArrow: (arr ? arr.Hwnd : 0), cb: cb, trigger: triggerType }),
+        g_MainRows.Push({ hwnd: ctrl.Hwnd, hwndArrow: (arr ? arr.Hwnd : 0), cb: cb, trigger: triggerType, baseBg: rowBg }),
         ctrl.OnEvent("Click", (ctrlObj, *) => ExecMenuRow(ctrlObj.Hwnd)),
         (arr ? arr.OnEvent("Click", (ctrlObj, *) => ExecMenuRow(ctrl.Hwnd)) : ""),
         
@@ -1178,9 +1178,9 @@ CreateCustomMenu() {
     AddDiv := () => (g_MnuMain.AddText("x4 y" (y+4) " w" (w-8) " h1 " BgOpt(CLR_DIVIDER), ""), y += 9)
 
     if (isPaused)
-        AddRow("Resume Prevention", ResumeActivity, "", "s11 w700 " TXT_OK)
+        AddRow("Resume Prevention", ResumeActivity, "", "s11 w600 " TXT_OK, false, CLR_FOOTER)
     else
-        AddRow("Pause Prevention", PauseActivity, "", "s11 w700 " TXT_WARN)
+        AddRow("Pause Prevention", PauseActivity, "", "s11 w600 " TXT_WARN, false, CLR_FOOTER)
     
     AddDiv()
     AddRow("Settings...", OpenSettings)
@@ -1289,9 +1289,9 @@ MenuTrackerLoop() {
 
     if (hoveredRow !== g_HoveredRowObj) {
         if (g_HoveredRowObj) {
-            try GuiCtrlFromHwnd(g_HoveredRowObj.hwnd).Opt(BgOpt(CLR_BG))
+            try GuiCtrlFromHwnd(g_HoveredRowObj.hwnd).Opt(BgOpt(g_HoveredRowObj.baseBg))
             if (g_HoveredRowObj.hwndArrow)
-                try GuiCtrlFromHwnd(g_HoveredRowObj.hwndArrow).Opt(BgOpt(CLR_BG))
+                try GuiCtrlFromHwnd(g_HoveredRowObj.hwndArrow).Opt(BgOpt(g_HoveredRowObj.baseBg))
         }
         if (hoveredRow) {
             try GuiCtrlFromHwnd(hoveredRow.hwnd).Opt(BgOpt(CLR_ACC_FILL))
