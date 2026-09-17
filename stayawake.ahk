@@ -5,7 +5,7 @@ SetWorkingDir(A_ScriptDir)
 Persistent()
 
 ; ============================================================
-; StayAwake - The Perfected Custom Tray Menu
+; StayAwake - The Perfected Custom Tray Menu (v9.0)
 ; ============================================================
 
 ; ===== MODULE: THEME TOKENS =================================
@@ -21,6 +21,16 @@ global CLR_BTN_FILL   := 0x1C1C1C
 global CLR_BTN_BORDER := 0x5A5A5A
 global CLR_ACC_FILL   := 0x2F6FED
 
+; Add / Delete buttons. Add is outlined with a green label;
+; Delete is solid red with white text.
+global CLR_ADD_BORDER := 0x2E6B3A
+global CLR_ADD_TEXT   := 0x5FE88A
+global CLR_DEL_FILL   := 0xC42B1C
+global CLR_DEL_TEXT   := 0xFFFFFF
+
+global MAX_BREAKS := 3
+global MAX_BLOCKS := 4
+
 global CLR_TEXT     := 0xE0E0E0
 global CLR_BTN_TEXT := 0xFFFFFF
 global CLR_TEXT_ACC := 0xFFFFFF
@@ -29,6 +39,10 @@ global TXT_BODY := "cE0E0E0"
 global TXT_OK   := "c5FE88A"
 global TXT_WARN := "cFF8080"
 global TXT_GHOST := "c5A5A5A"
+; TXT_GHOST is for decoration only. Anything the user must READ
+; uses TXT_HINT -- #5A5A5A on a #0F0F0F background is about 3:1
+; contrast, which disappears at 9pt.
+global TXT_HINT  := "cE0E0E0"
 
 global HEADER_HINT_GAP := 4
 global HINT_CTRL_GAP   := 10
@@ -49,7 +63,7 @@ BgOpt(clr) {
 
 
 ; ===== MODULE: APP STATE GLOBALS ============================
-global APP_VERSION := "8.9"
+global APP_VERSION := "9.0"
 
 global timerIntervalMinutes := 5
 global isPaused := false
@@ -71,6 +85,17 @@ global g_customCodePID := 0
 global g_ahkExePath := ""
 
 global g_shutdownPending := false
+
+; --- Pause ownership ---------------------------------------------
+; isPaused says WHETHER prevention is off; these say WHO turned it
+; off and whether the user has taken manual control. A manual
+; action holds until the schedule's intent changes (its next
+; transition), and then the schedule takes ownership back.
+global g_pauseReason      := "none"   ; "none" | "user" | "break" | "schedule"
+global g_manualOverride   := false
+global g_overrideBaseline := ""
+global g_preBreakActive   := true
+global g_activeBreakEnd   := ""   ; which break is running, for the tray tip
 
 LoadSettings()
 ; ===== END MODULE: APP STATE GLOBALS ========================
@@ -233,6 +258,17 @@ AddFooterBar(guiObj, yPos, w, h) {
     return guiObj.AddText("x0 y" yPos " w" w " h" h " " BgOpt(CLR_FOOTER), "")
 }
 
+; Moves a control to absolute y, then returns the next free y:
+; the control's measured bottom plus a gap. Measuring instead of
+; assuming a height is what keeps the stack correct at any DPI
+; and after any font change -- a hardcoded advance that is
+; smaller than the control silently draws the next one on top.
+PlaceBelow(ctrl, y, gapAfter) {
+    ctrl.Move( , y)
+    ctrl.GetPos( , , , &h)
+    return y + h + gapAfter
+}
+
 AddThemedRadio(guiObj, opts, labelText, checked, labelWidth := 180) {
     local r := guiObj.AddRadio(opts " w16 h16 Checked" (checked ? "1" : "0"), "")
     ApplyDarkControl(r)
@@ -267,6 +303,22 @@ SetStatusLine(line, glyph, msg, colorOpt) {
     line.icon.Value := glyph
     line.text.SetFont("s10 w400 " colorOpt, UI_FONT)
     line.text.Value := msg
+}
+
+; Like MakeButton but with explicit colors, for the green
+; "+ Add" and red "Delete" controls.
+MakeColorButton(guiObj, x, y, w, h, text, fillClr, borderClr, textClr, cb := "", bgClr := "", bold := false) {
+    global g_btnRefs, UI_FONT, CLR_BG, BTN_RADIUS
+    if (bgClr = "")
+        bgClr := CLR_BG
+    local scale := GetDpiScale(guiObj.Hwnd)
+    local hBmp := DrawButtonBitmap(Round(w * scale), Round(h * scale), text, UI_FONT,
+        10 * scale, bold, fillClr, borderClr, textClr, bgClr, BTN_RADIUS * scale)
+    local pic := guiObj.AddPicture("x" x " y" y " w" w " h" h " +0x100", "HBITMAP:*" hBmp)
+    if (cb != "")
+        pic.OnEvent("Click", (*) => cb())
+    g_btnRefs.Push(pic)
+    return pic
 }
 
 MakeDayPill(guiObj, x, y, size, letter, checked, cb := "") {
@@ -309,6 +361,14 @@ MakeTimeChip(guiObj, x, y, hourVal, minVal) {
     minEdit.OnEvent("LoseFocus", (ctrl, *) => (ctrl.Value != "" && IsInteger(ctrl.Value)) ? (ctrl.Value := Format("{:02}", Integer(ctrl.Value))) : (ctrl.Value := "00"))
     return { plate: plate, hour: hourEdit, min: minEdit }
 }
+; Writes an "HH:MM" string into a chip. Used when deleting a row
+; shifts the rows below it upward.
+SetTimeChipStr(chip, timeStr) {
+    local p := ParseTimeStr(timeStr)
+    chip.hour.Value := Format("{:02}", p.h)
+    chip.min.Value  := Format("{:02}", p.m)
+}
+
 ReadTimeChip(chip, maxHour := 23) {
     local hv := Integer(chip.hour.Value = "" ? 0 : chip.hour.Value)
     local mv := Integer(chip.min.Value = "" ? 0 : chip.min.Value)
@@ -329,7 +389,6 @@ SetChipVisible(chip, state) {
     chip.plate.Visible := state, chip.hour.Visible := state, chip.min.Visible := state
 }
 
-; Safely parses INI time strings (e.g. "07:00") and prevents crashes if empty
 ParseTimeStr(timeStr, defaultH := 7, defaultM := 0) {
     local parts := StrSplit(timeStr, ":")
     local h := (parts.Length >= 1 && IsInteger(parts[1])) ? Integer(parts[1]) : defaultH
@@ -342,10 +401,8 @@ ParseTimeStr(timeStr, defaultH := 7, defaultM := 0) {
 ; ===== MODULE: CORE & TIMERS & SESSION HOOKS ================
 SetPowerRequest(enable) {
     if (enable) {
-        ; ES_CONTINUOUS (0x80000000) | ES_DISPLAY_REQUIRED (0x00000002) | ES_SYSTEM_REQUIRED (0x00000001)
         DllCall("Kernel32.dll\SetThreadExecutionState", "UInt", 0x80000003)
     } else {
-        ; Clears flags: ES_CONTINUOUS
         DllCall("Kernel32.dll\SetThreadExecutionState", "UInt", 0x80000000)
     }
 }
@@ -376,17 +433,109 @@ IsTimeInRange(current, start, end) {
     else
         return (currentNum >= startNum || currentNum < endNum)
 }
+
+; "HH:MM" -> comparable integer ("09:12" -> 912). Time chips hold
+; strings, and AHK v2 relational operators reject strings outright
+; ("Expected a Number but got a String"), so every time comparison
+; has to go through this.
+TimeToNum(timeStr) {
+    return Integer(StrReplace(timeStr, ":"))
+}
+
+; Plain-English part of the day for an "HH:MM" string. Used by the
+; wrapped-window notes, which used to say "the next morning" for
+; every end time -- wrong for anything past noon.
+DayPartName(timeStr) {
+    local h := Integer(SubStr(timeStr, 1, 2))
+    if (h <= 11)
+        return "morning"
+    if (h <= 16)
+        return "afternoon"
+    if (h <= 20)
+        return "evening"
+    return "night"
+}
+
+; A window whose end reads earlier than its start runs past
+; midnight. That is a legitimate overnight shift, not a typo, so
+; it is never blocked -- the UI states it back instead.
+IsWrappedTime(startStr, endStr) {
+    return TimeToNum(startStr) > TimeToNum(endStr)
+}
+
+; Does the window that STARTED on a given day cover the current
+; time? isYesterday asks about the post-midnight tail of the
+; previous day's window, which is how a wrapped shift keeps
+; belonging to the night it began on.
+WindowCovers(startStr, endStr, curNum, isYesterday) {
+    local s := TimeToNum(startStr), e := TimeToNum(endStr)
+    if (s = e)
+        return false
+    if (s < e)
+        return !isYesterday && curNum >= s && curNum < e
+    return isYesterday ? (curNum < e) : (curNum >= s)
+}
+
+; The tray tip says WHY prevention is off, not just that it is.
 GetScheduleTooltip() {
-    global scheduleMode, scheduleData, isPaused
-    if (scheduleMode = "disabled")
+    global scheduleMode, scheduleData, isPaused, g_pauseReason
+    global g_manualOverride, g_activeBreakEnd
+
+    if (isPaused) {
+        if (g_manualOverride && g_pauseReason = "user")
+            return " - paused by you"
+        if (g_pauseReason = "break" && g_activeBreakEnd != "")
+            return " - break until " g_activeBreakEnd
+        if (scheduleMode != "disabled") {
+            local nextOn := NextBlockStart()
+            if (nextOn != "")
+                return " - resumes at " nextOn
+        }
         return ""
-    currentDay := FormatTime(, "dddd")
-    if (scheduleData.Get("SameTime", true))
-        return isPaused ? " (Schedule: On at " scheduleData.Get("SimpleOnTime", "07:00") ")" : " (Schedule: Off at " scheduleData.Get("SimpleOffTime", "18:00") ")"
-    if (scheduleData.Get(currentDay "Enabled", true))
-        return isPaused ? " (Schedule: On at " scheduleData.Get(currentDay "On", "07:00") ")" : " (Schedule: Off at " scheduleData.Get(currentDay "Off", "18:00") ")"
+    }
+
+    if (g_manualOverride)
+        return " - resumed by you"
+    if (scheduleMode != "disabled") {
+        local endsAt := CurrentBlockEnd()
+        if (endsAt != "")
+            return " - until " endsAt
+    }
     return ""
 }
+
+; The earliest start among blocks that include today.
+NextBlockStart() {
+    global scheduleData
+    local tIdx := A_WDay, best := ""
+    loop scheduleData.Get("BlockCount", 1) {
+        local days := scheduleData.Get("Block" A_Index "Days", "1111111")
+        if (SubStr(days, tIdx, 1) != "1")
+            continue
+        local on := scheduleData.Get("Block" A_Index "On", "07:00")
+        if (best = "" || TimeToNum(on) < TimeToNum(best))
+            best := on
+    }
+    return best
+}
+
+; The end time of whichever block is covering this moment.
+CurrentBlockEnd() {
+    global scheduleData
+    local curNum := TimeToNum(FormatTime(, "HH:mm"))
+    local tIdx := A_WDay, yIdx := (A_WDay = 1) ? 7 : A_WDay - 1
+    loop scheduleData.Get("BlockCount", 1) {
+        local on   := scheduleData.Get("Block" A_Index "On", "07:00")
+        local off  := scheduleData.Get("Block" A_Index "Off", "18:00")
+        local days := scheduleData.Get("Block" A_Index "Days", "1111111")
+        if (SubStr(days, tIdx, 1) = "1" && WindowCovers(on, off, curNum, false))
+            return off
+        if (SubStr(days, yIdx, 1) = "1" && WindowCovers(on, off, curNum, true))
+            return off
+    }
+    return ""
+}
+
 ArmIntelligentTimer() {
     global timerIntervalMinutes, g_dueAtTick, g_keepAwakeTimerArmed, isPaused, g_isLocked
     if (isPaused || g_isLocked)
@@ -457,7 +606,17 @@ WM_WTSSESSION_CHANGE(wParam, lParam, msg, hwnd) {
             StartIntelligentTimers()
             RefreshPowerState()
         }
+        ; The clock may have moved a long way while locked.
+        CheckSchedule()
     }
+}
+
+; Timers do not fire while the machine is suspended, so without
+; this the schedule can lag up to a minute behind after a wake.
+WM_POWERBROADCAST(wParam, lParam, msg, hwnd) {
+    if (wParam == 0x12 || wParam == 0x07)   ; RESUMEAUTOMATIC / RESUMESUSPEND
+        SetTimer(() => CheckSchedule(), -1500)
+    return true
 }
 ; ===== END MODULE: CORE & TIMERS & SESSION HOOKS ============
 
@@ -583,176 +742,476 @@ HandleStopCustomCode(*) => StopCustomCode()
 
 
 ; ===== MODULE: SCHEDULE WINDOW ==============================
+; Two sections, one pattern. A Break is a time range. An Hour
+; block is a time range plus the days it covers. Both are added
+; with a green "+", removed with a red "Delete", and both say
+; back when they cross midnight.
+;
+; Every control is created up front and then shown, hidden and
+; positioned by RefreshRows -- creating controls in a live Gui
+; flickers and is the one thing this window never does.
 OpenScheduleSettings(*) {
-    global scheduleMode, scheduleData, UI_FONT, CLR_BG, CLR_FOOTER, TXT_BODY, HEADER_HINT_GAP, HINT_CTRL_GAP, SECTION_GAP_Y, GUI_PAD_X, g_btnRefs
+    global scheduleMode, scheduleData, g_btnRefs
+    global UI_FONT, CLR_BG, CLR_FOOTER, TXT_BODY, TXT_HINT
+    global CLR_ADD_BORDER, CLR_ADD_TEXT, CLR_DEL_FILL, CLR_DEL_TEXT, CLR_BTN_FILL
+    global HEADER_HINT_GAP, HINT_CTRL_GAP, SECTION_GAP_Y, GUI_PAD_X
+    global MAX_BREAKS, MAX_BLOCKS
     static guiSchedule := ""
+
     try if (IsObject(guiSchedule))
         guiSchedule.Destroy()
 
     g_btnRefs := []
     local isWindowShown := false
-    local WIN_W := 520, bodyW := WIN_W - (GUI_PAD_X * 2), rightEdge := GUI_PAD_X + bodyW
+
+    local WIN_W := 830, bodyW := WIN_W - (GUI_PAD_X * 2), rightEdge := GUI_PAD_X + bodyW
+    local CHIP_H := 32, CHIP_W := 92, ROW_H := 44, RADIO_H := 20
+    local pillSize := 28, pillGap := 5
+    local g_lastWrapSig := ""
+
+    local breakCount := scheduleData.Get("BreakCount", 0)
+    local blockCount := scheduleData.Get("BlockCount", 1)
+    if (blockCount < 1)
+        blockCount := 1
+
+    local letters := ["S","M","T","W","T","F","S"]
 
     guiSchedule := Gui("+AlwaysOnTop -Resize", "Schedule Settings")
-    guiSchedule.MarginX := GUI_PAD_X, guiSchedule.MarginY := 20, guiSchedule.BackColor := CLR_BG
+    guiSchedule.MarginX := GUI_PAD_X
+    guiSchedule.MarginY := 20
+    guiSchedule.BackColor := CLR_BG
     ApplyDarkTitleBar(guiSchedule)
 
-    days := ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
-    letters := ["S","M","T","W","T","F","S"]
-
     guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
-    guiSchedule.AddText("xm w" bodyW, "This schedule automatically turns StayAwake on and off. You can control the manual Active/Paused state in the main Settings window.")
+    introText := guiSchedule.AddText("xm w" bodyW, "This schedule automatically turns StayAwake on and off. You can control the manual Active/Paused state in the main Settings window.")
+
+    ; ---------- BREAKS ----------
+    divBreakTop := AddDivider(guiSchedule, "xm y0 w" bodyW)
 
     guiSchedule.SetFont("s11 w600 " TXT_BODY, UI_FONT)
-    guiSchedule.AddText("xm y+" SECTION_GAP_Y " w" bodyW, "Schedule Mode")
+    hdrBreaks := guiSchedule.AddText("xm y0 w" bodyW, "Breaks")
 
-    guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
-    rOff := AddThemedRadio(guiSchedule, "xm y+" HINT_CTRL_GAP, "Disabled", (scheduleMode = "disabled"), 110)
-    rOn := AddThemedRadio(guiSchedule, "x180 yp-1", "Scheduled", (scheduleMode != "disabled"), 120)
+    guiSchedule.SetFont("s10 w400 " TXT_HINT, UI_FONT)
+    hintBreaks := guiSchedule.AddText("xm y0 w" bodyW, "Breaks pause StayAwake every day, whatever the schedule is doing.")
 
-    div1 := AddDivider(guiSchedule, "xm y+" SECTION_GAP_Y " w" bodyW)
+    breakRows := []
+    loop MAX_BREAKS {
+        local i := A_Index
+        local s := ParseTimeStr(scheduleData.Get("Break" i "Start", "12:00"), 12, 0)
+        local e := ParseTimeStr(scheduleData.Get("Break" i "End", "13:00"), 13, 0)
 
-    guiSchedule.SetFont("s11 w600 " TXT_BODY, UI_FONT)
-    hdrDays := guiSchedule.AddText("xm y+" SECTION_GAP_Y " w" bodyW, "Active Days")
-
-    guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
-    hintDays := guiSchedule.AddText("xm y+" HEADER_HINT_GAP " w" bodyW, "Days not selected stay on your launch behavior setting.")
-    hintDays.GetPos(&hdX, &hdY, &hdW, &hdH)
-    pillY := hdY + hdH + HINT_CTRL_GAP, pillSize := 34, pillGap := 8
-
-    pills := []
-    for i, letter in letters {
-        pills.Push(MakeDayPill(guiSchedule, GUI_PAD_X + ((i - 1) * (pillSize + pillGap)), pillY, pillSize, letter, scheduleData.Get(days[i] "Enabled", true), (*) => RefreshRows()))
-    }
-
-    div2 := AddDivider(guiSchedule, "xm y" (pillY + pillSize + SECTION_GAP_Y) " w" bodyW)
-
-    timesHdrY := pillY + pillSize + SECTION_GAP_Y + SECTION_GAP_Y
-    guiSchedule.SetFont("s11 w600 " TXT_BODY, UI_FONT)
-    hdrTimes := guiSchedule.AddText("xm y" timesHdrY " w" bodyW, "Times (24-Hour Format)")
-
-    guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
-    chkSame := guiSchedule.AddCheckbox("xm y+" HINT_CTRL_GAP " w" bodyW . " Checked" (scheduleData.Get("SameTime", true) ? "1" : "0"), "Same time on every active day")
-    ApplyDarkControl(chkSame)
-    chkSame.GetPos(&csX, &csY, &csW, &csH)
-    rowStartY := csY + csH + 16
-
-    sharedOn := ParseTimeStr(scheduleData.Get("SimpleOnTime", "07:00"))
-    sharedOff := ParseTimeStr(scheduleData.Get("SimpleOffTime", "18:00"))
-    
-    guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
-    lblSharedOn := guiSchedule.AddText("xm y" (rowStartY + 7) " w78", "Turn on at")
-    chipSharedOn := MakeTimeChip(guiSchedule, GUI_PAD_X + 86, rowStartY, sharedOn.h, sharedOn.m)
-    lblSharedOff := guiSchedule.AddText("x" (GUI_PAD_X + 200) " y" (rowStartY + 7) " w78", "Turn off at")
-    chipSharedOff := MakeTimeChip(guiSchedule, GUI_PAD_X + 286, rowStartY, sharedOff.h, sharedOff.m)
-
-    rowH := 40
-    dayRows := []
-    for i, day in days {
-        local ry := rowStartY + ((i - 1) * rowH)
-        local onTime := ParseTimeStr(scheduleData.Get(day "On", "07:00"))
-        local offTime := ParseTimeStr(scheduleData.Get(day "Off", "18:00"))
         guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
-        local lbl := guiSchedule.AddText("xm y" (ry + 7) " w96", day)
-        local chipOn := MakeTimeChip(guiSchedule, GUI_PAD_X + 104, ry, onTime.h, onTime.m)
-        local lblTo := guiSchedule.AddText("x" (GUI_PAD_X + 206) " y" (ry + 7) " w22", "to")
-        local chipOff := MakeTimeChip(guiSchedule, GUI_PAD_X + 234, ry, offTime.h, offTime.m)
-        local offNote := guiSchedule.AddText("x" (GUI_PAD_X + 104) " y" (ry + 7) " w120", "Not active")
-        dayRows.Push({ label: lbl, chipOn: chipOn, lblTo: lblTo, chipOff: chipOff, note: offNote })
+        local lbl      := guiSchedule.AddText("xm y0 w66", "Break " i)
+        local chipS    := MakeTimeChip(guiSchedule, 0, 0, s.h, s.m)
+        local lblTo    := guiSchedule.AddText("xm y0 w20", "to")
+        local chipE    := MakeTimeChip(guiSchedule, 0, 0, e.h, e.m)
+
+        guiSchedule.SetFont("s9 w400 " TXT_HINT, UI_FONT)
+        local wrapLbl  := guiSchedule.AddText("xm y0 w300", "")
+
+        local btnDel   := MakeColorButton(guiSchedule, 0, 0, 88, 30, "Delete",
+            CLR_DEL_FILL, CLR_DEL_FILL, CLR_DEL_TEXT, DeleteBreakAt.Bind(i))
+
+        breakRows.Push({ label: lbl, chipS: chipS, lblTo: lblTo, chipE: chipE
+                       , wrap: wrapLbl, del: btnDel })
     }
 
+    ; Created at the content margin: PlaceBelow only adjusts Y, so
+    ; anything left at x=0 stays jammed against the window edge.
+    btnAddBreak := MakeColorButton(guiSchedule, GUI_PAD_X, 0, 132, 32, "+ Add Break",
+        CLR_BTN_FILL, CLR_ADD_BORDER, CLR_ADD_TEXT, AddBreak, , true)
+
+    guiSchedule.SetFont("s10 w400 " TXT_HINT, UI_FONT)
+    lblBreaksMax := guiSchedule.AddText("xm y0 w" bodyW, "Maximum of " MAX_BREAKS " breaks.")
+
+    ; ---------- SCHEDULE MODE ----------
+    divModeTop := AddDivider(guiSchedule, "xm y0 w" bodyW)
+
+    guiSchedule.SetFont("s11 w600 " TXT_BODY, UI_FONT)
+    hdrMode := guiSchedule.AddText("xm y0 w" bodyW, "Schedule Mode")
+
+    guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
+    rOff := AddThemedRadio(guiSchedule, "xm y0", "Disabled", (scheduleMode = "disabled"), 110)
+    rOn  := AddThemedRadio(guiSchedule, "xm y0", "Scheduled", (scheduleMode != "disabled"), 120)
+
+    ; ---------- HOURS ----------
+    divHours := AddDivider(guiSchedule, "xm y0 w" bodyW)
+
+    guiSchedule.SetFont("s11 w600 " TXT_BODY, UI_FONT)
+    hdrHours := guiSchedule.AddText("xm y0 w" bodyW, "Hours (24-Hour Format)")
+
+    guiSchedule.SetFont("s10 w400 " TXT_HINT, UI_FONT)
+    hintHours := guiSchedule.AddText("xm y0 w" bodyW, "Days not in any schedule follow your launch behavior setting.")
+
+    blockRows := []
+    loop MAX_BLOCKS {
+        local i := A_Index
+        local on  := ParseTimeStr(scheduleData.Get("Block" i "On", "07:00"), 7, 0)
+        local off := ParseTimeStr(scheduleData.Get("Block" i "Off", "18:00"), 18, 0)
+        local flags := scheduleData.Get("Block" i "Days", "1111111")
+
+        guiSchedule.SetFont("s10 w400 " TXT_BODY, UI_FONT)
+        local chipOn  := MakeTimeChip(guiSchedule, 0, 0, on.h, on.m)
+        local lblTo   := guiSchedule.AddText("xm y0 w20", "to")
+        local chipOff := MakeTimeChip(guiSchedule, 0, 0, off.h, off.m)
+
+        guiSchedule.SetFont("s9 w400 " TXT_HINT, UI_FONT)
+        local wrapLbl := guiSchedule.AddText("xm y0 w220", "")
+
+        local rowPills := []
+        loop 7 {
+            local d := A_Index
+            rowPills.Push(MakeDayPill(guiSchedule, 0, 0, pillSize, letters[d],
+                (SubStr(flags, d, 1) = "1"), UpdateWrapNotes))
+        }
+
+        local btnDel := MakeColorButton(guiSchedule, 0, 0, 88, 30, "Delete",
+            CLR_DEL_FILL, CLR_DEL_FILL, CLR_DEL_TEXT, DeleteBlockAt.Bind(i))
+
+        blockRows.Push({ chipOn: chipOn, lblTo: lblTo, chipOff: chipOff
+                       , wrap: wrapLbl, pills: rowPills, del: btnDel })
+    }
+
+    btnAddBlock := MakeColorButton(guiSchedule, GUI_PAD_X, 0, 148, 32, "+ Add Schedule",
+        CLR_BTN_FILL, CLR_ADD_BORDER, CLR_ADD_TEXT, AddBlock, , true)
+
+    guiSchedule.SetFont("s10 w400 " TXT_HINT, UI_FONT)
+    lblBlocksMax := guiSchedule.AddText("xm y0 w" bodyW, "Maximum of " MAX_BLOCKS " schedules.")
+
+    ; ---------- FOOTER ----------
     ctrlFooterBar := AddFooterBar(guiSchedule, 0, WIN_W, 72)
     btnDefaults := MakeButton(guiSchedule, GUI_PAD_X, 0, 108, 36, "Defaults", false, ResetDefaults, true, CLR_FOOTER)
     btnCancel := MakeButton(guiSchedule, rightEdge - 214, 0, 102, 36, "Cancel", false, (*) => guiSchedule.Destroy(), true, CLR_FOOTER)
     btnSave := MakeButton(guiSchedule, rightEdge - 102, 0, 102, 36, "Save", true, SaveNow, true, CLR_FOOTER)
     ctrlBottomEdge := guiSchedule.AddText("x0 y0 w" WIN_W " h1 " BgOpt(CLR_FOOTER), "")
 
-    RefreshRows(*) {
-        local scheduled := (rOn.radio.Value = 1), sameTime := (chkSame.Value = 1)
-        div1.Visible := scheduled, hdrDays.Visible := scheduled, hintDays.Visible := scheduled
-        div2.Visible := scheduled, hdrTimes.Visible := scheduled, chkSame.Visible := scheduled
+    ; ---------- ADD / DELETE ----------
+    AddBreak(*) {
+        if (breakCount >= MAX_BREAKS)
+            return
+        breakCount++
+        SetTimeChipStr(breakRows[breakCount].chipS, "12:00")
+        SetTimeChipStr(breakRows[breakCount].chipE, "13:00")
+        RefreshRows()
+    }
 
-        for p in pills
-            (p.on.Visible := scheduled && p.enabled, p.off.Visible := scheduled && !p.enabled)
+    ; Rows below the deleted one shift up, so the list stays
+    ; contiguous and no empty row is ever shown.
+    DeleteBreakAt(idx, *) {
+        if (idx > breakCount)
+            return
+        loop (breakCount - idx) {
+            local to := idx + A_Index - 1, from := idx + A_Index
+            SetTimeChipStr(breakRows[to].chipS, ReadTimeChip(breakRows[from].chipS))
+            SetTimeChipStr(breakRows[to].chipE, ReadTimeChip(breakRows[from].chipE))
+        }
+        breakCount--
+        RefreshRows()
+    }
 
-        local showShared := scheduled && sameTime
-        lblSharedOn.Visible := showShared, lblSharedOff.Visible := showShared
-        SetChipVisible(chipSharedOn, showShared), SetChipVisible(chipSharedOff, showShared)
+    AddBlock(*) {
+        if (blockCount >= MAX_BLOCKS)
+            return
+        blockCount++
+        SetTimeChipStr(blockRows[blockCount].chipOn, "07:00")
+        SetTimeChipStr(blockRows[blockCount].chipOff, "18:00")
+        for _, p in blockRows[blockCount].pills
+            p.enabled := true
+        RefreshRows()
+    }
 
-        for i, row in dayRows {
-            local showRow := scheduled && !sameTime, dayOn := pills[i].enabled
-            row.label.Visible := showRow, row.label.Opt(dayOn ? "cF2F2F2" : "c6E6E6E"), row.label.Redraw()
-            SetChipVisible(row.chipOn, showRow && dayOn), SetChipVisible(row.chipOff, showRow && dayOn)
-            row.lblTo.Visible := showRow && dayOn, row.note.Visible := showRow && !dayOn
+    DeleteBlockAt(idx, *) {
+        if (idx > blockCount || blockCount <= 1)
+            return
+        loop (blockCount - idx) {
+            local to := idx + A_Index - 1, from := idx + A_Index
+            SetTimeChipStr(blockRows[to].chipOn, ReadTimeChip(blockRows[from].chipOn))
+            SetTimeChipStr(blockRows[to].chipOff, ReadTimeChip(blockRows[from].chipOff))
+            for d, p in blockRows[to].pills
+                p.enabled := blockRows[from].pills[d].enabled
+        }
+        blockCount--
+        RefreshRows()
+    }
+
+    ; ---------- SAY IT BACK ----------
+    PairWrapped(chipA, chipB) {
+        return IsWrappedTime(ReadTimeChip(chipA), ReadTimeChip(chipB))
+    }
+
+    ; Fingerprint of which notes are showing. A note changes the
+    ; window height, so layout re-runs only when this changes --
+    ; not on every keystroke.
+    WrapSignature() {
+        local sig := breakCount "|" blockCount "|" (rOn.radio.Value = 1 ? "S" : "D")
+        loop breakCount
+            sig .= PairWrapped(breakRows[A_Index].chipS, breakRows[A_Index].chipE) ? "b" : "-"
+        loop blockCount
+            sig .= PairWrapped(blockRows[A_Index].chipOn, blockRows[A_Index].chipOff) ? "h" : "-"
+        return sig
+    }
+
+    UpdateWrapNotes(*) {
+        local scheduled := (rOn.radio.Value = 1)
+
+        loop MAX_BREAKS {
+            local i := A_Index
+            local shown := (i <= breakCount)
+            local w := shown && PairWrapped(breakRows[i].chipS, breakRows[i].chipE)
+            breakRows[i].wrap.Visible := w
+            if (w) {
+                local et := ReadTimeChip(breakRows[i].chipE)
+                breakRows[i].wrap.Value := "ends " et " the following " DayPartName(et)
+            }
         }
 
-        rOn.radio.GetPos(&rx, &ry, &rw, &rh)
-        local modeBottomY := ry + rh
-        local activeContentY := !scheduled ? modeBottomY : (sameTime ? (rowStartY + 40) : (rowStartY + (rowH * 7)))
-        local footerY := activeContentY + 14, footBtnY := footerY + 19
+        loop MAX_BLOCKS {
+            local i := A_Index
+            local shown := scheduled && (i <= blockCount)
+            local w := shown && PairWrapped(blockRows[i].chipOn, blockRows[i].chipOff)
+            blockRows[i].wrap.Visible := w
+            if (w) {
+                local ot := ReadTimeChip(blockRows[i].chipOff)
+                blockRows[i].wrap.Value := "ends " ot " the following " DayPartName(ot)
+            }
+        }
+    }
 
-        ctrlFooterBar.Move( , footerY), btnDefaults.Move( , footBtnY), btnCancel.Move( , footBtnY), btnSave.Move( , footBtnY), ctrlBottomEdge.Move( , footerY + 72)
-        
-        guiSchedule.MarginX := 0
+    OnChipEdit(*) {
+        local sig := WrapSignature()
+        if (sig != g_lastWrapSig) {
+            g_lastWrapSig := sig
+            RefreshRows()
+        } else {
+            UpdateWrapNotes()
+        }
+    }
+
+    WireChip(chip) {
+        chip.hour.OnEvent("Change", OnChipEdit)
+        chip.min.OnEvent("Change", OnChipEdit)
+    }
+    for _, r in breakRows
+        (WireChip(r.chipS), WireChip(r.chipE))
+    for _, r in blockRows
+        (WireChip(r.chipOn), WireChip(r.chipOff))
+
+    ; ---------- LAYOUT ----------
+    RefreshRows(*) {
         if (isWindowShown)
+            SendMessage(0x0B, 0, 0, guiSchedule.Hwnd)
+
+        UpdateWrapNotes()
+        g_lastWrapSig := WrapSignature()
+
+        local scheduled := (rOn.radio.Value = 1)
+
+        introText.GetPos( , &itY, , &itH)
+        local curY := itY + itH + SECTION_GAP_Y
+
+        ; --- Breaks ---
+        curY := PlaceBelow(divBreakTop, curY, SECTION_GAP_Y)
+        curY := PlaceBelow(hdrBreaks, curY, HEADER_HINT_GAP)
+        curY := PlaceBelow(hintBreaks, curY, HINT_CTRL_GAP)
+
+        loop MAX_BREAKS {
+            local i := A_Index, r := breakRows[i], shown := (i <= breakCount)
+
+            r.label.Visible := shown, r.lblTo.Visible := shown, r.del.Visible := shown
+            SetChipVisible(r.chipS, shown), SetChipVisible(r.chipE, shown)
+            if (!shown) {
+                r.wrap.Visible := false
+                continue
+            }
+
+            r.label.Move(GUI_PAD_X, curY + 7)
+            r.chipS.plate.Move(GUI_PAD_X + 72, curY)
+            r.chipS.hour.Move(GUI_PAD_X + 72 + 11, curY + 6)
+            r.chipS.min.Move(GUI_PAD_X + 72 + 53, curY + 6)
+            r.lblTo.Move(GUI_PAD_X + 172, curY + 7)
+            r.chipE.plate.Move(GUI_PAD_X + 196, curY)
+            r.chipE.hour.Move(GUI_PAD_X + 196 + 11, curY + 6)
+            r.chipE.min.Move(GUI_PAD_X + 196 + 53, curY + 6)
+            r.wrap.Move(GUI_PAD_X + 300, curY + 9)
+            r.del.Move(rightEdge - 88, curY + 1)
+            curY += ROW_H
+        }
+
+        btnAddBreak.Visible := (breakCount < MAX_BREAKS)
+        lblBreaksMax.Visible := (breakCount >= MAX_BREAKS)
+        if (breakCount < MAX_BREAKS)
+            curY := PlaceBelow(btnAddBreak, curY + 2, 0)
+        else
+            curY := PlaceBelow(lblBreaksMax, curY + 6, 0)
+        curY += SECTION_GAP_Y
+
+        ; --- Schedule mode ---
+        curY := PlaceBelow(divModeTop, curY, SECTION_GAP_Y)
+        curY := PlaceBelow(hdrMode, curY, HINT_CTRL_GAP)
+        rOff.radio.Move(GUI_PAD_X, curY), rOff.label.Move(GUI_PAD_X + 24, curY + 1)
+        rOn.radio.Move(GUI_PAD_X + 200, curY), rOn.label.Move(GUI_PAD_X + 224, curY + 1)
+        curY += RADIO_H + SECTION_GAP_Y
+
+        ; --- Hours ---
+        divHours.Visible := scheduled
+        hdrHours.Visible := scheduled
+        hintHours.Visible := scheduled
+        btnAddBlock.Visible := scheduled && (blockCount < MAX_BLOCKS)
+        lblBlocksMax.Visible := scheduled && (blockCount >= MAX_BLOCKS)
+
+        loop MAX_BLOCKS {
+            local i := A_Index, r := blockRows[i], shown := scheduled && (i <= blockCount)
+            r.lblTo.Visible := shown
+            ; With one schedule left there is nothing to delete to.
+            r.del.Visible := shown && (blockCount > 1)
+            SetChipVisible(r.chipOn, shown), SetChipVisible(r.chipOff, shown)
+            for _, p in r.pills
+                (p.on.Visible := shown && p.enabled, p.off.Visible := shown && !p.enabled)
+            if (!shown)
+                r.wrap.Visible := false
+        }
+
+        if (scheduled) {
+            curY := PlaceBelow(divHours, curY, SECTION_GAP_Y)
+            curY := PlaceBelow(hdrHours, curY, HEADER_HINT_GAP)
+            curY := PlaceBelow(hintHours, curY, HINT_CTRL_GAP)
+
+            loop blockCount {
+                local r := blockRows[A_Index]
+                r.chipOn.plate.Move(GUI_PAD_X, curY)
+                r.chipOn.hour.Move(GUI_PAD_X + 11, curY + 6)
+                r.chipOn.min.Move(GUI_PAD_X + 53, curY + 6)
+                r.lblTo.Move(GUI_PAD_X + 100, curY + 7)
+                r.chipOff.plate.Move(GUI_PAD_X + 124, curY)
+                r.chipOff.hour.Move(GUI_PAD_X + 124 + 11, curY + 6)
+                r.chipOff.min.Move(GUI_PAD_X + 124 + 53, curY + 6)
+                r.wrap.Move(GUI_PAD_X + 224, curY + 9)
+
+                local px := GUI_PAD_X + 452
+                for d, p in r.pills {
+                    local pxThis := px + ((d - 1) * (pillSize + pillGap))
+                    p.on.Move(pxThis, curY + 2), p.off.Move(pxThis, curY + 2)
+                }
+                r.del.Move(rightEdge - 88, curY + 1)
+                curY += ROW_H
+            }
+
+            if (blockCount < MAX_BLOCKS)
+                curY := PlaceBelow(btnAddBlock, curY + 2, 0)
+            else
+                curY := PlaceBelow(lblBlocksMax, curY + 6, 0)
+        } else {
+            curY += 10
+        }
+
+        ; --- Footer ---
+        local footerY := curY + 16, footBtnY := footerY + 19
+        ctrlFooterBar.Move( , footerY)
+        btnDefaults.Move( , footBtnY)
+        btnCancel.Move( , footBtnY)
+        btnSave.Move( , footBtnY)
+        ctrlBottomEdge.Move( , footerY + 72)
+
+        guiSchedule.MarginX := 0
+        if (isWindowShown) {
             guiSchedule.Show("AutoSize")
+            SendMessage(0x0B, 1, 0, guiSchedule.Hwnd)
+            WinRedraw(guiSchedule.Hwnd)
+        }
     }
 
     ResetDefaults(*) {
-        SetTimeChip(chipSharedOn, 7, 0), SetTimeChip(chipSharedOff, 18, 0)
-        for i, row in dayRows {
-            SetTimeChip(row.chipOn, 7, 0), SetTimeChip(row.chipOff, 18, 0), pills[i].enabled := true
+        breakCount := 0
+        loop MAX_BREAKS {
+            SetTimeChipStr(breakRows[A_Index].chipS, "12:00")
+            SetTimeChipStr(breakRows[A_Index].chipE, "13:00")
         }
-        chkSame.Value := 1
+        blockCount := 1
+        loop MAX_BLOCKS {
+            SetTimeChipStr(blockRows[A_Index].chipOn, "07:00")
+            SetTimeChipStr(blockRows[A_Index].chipOff, "18:00")
+            for _, p in blockRows[A_Index].pills
+                p.enabled := true
+        }
         RefreshRows()
     }
 
     SaveNow(*) {
+        ; An end earlier than a start is a valid overnight window --
+        ; the note says so. Only start = end can never fire.
+        loop breakCount {
+            local i := A_Index
+            if (TimeToNum(ReadTimeChip(breakRows[i].chipS)) = TimeToNum(ReadTimeChip(breakRows[i].chipE))) {
+                ShowCustomTooltip("Break " i ": start and end cannot be the same time.", "paused", 3500)
+                return
+            }
+        }
         if (rOn.radio.Value = 1) {
-            if (chkSame.Value = 1) {
-                if (ReadTimeChip(chipSharedOn) >= ReadTimeChip(chipSharedOff)) {
-                    ShowCustomTooltip("Turn on time must be earlier than Turn off time.", "paused", 3500)
+            loop blockCount {
+                local i := A_Index
+                if (TimeToNum(ReadTimeChip(blockRows[i].chipOn)) = TimeToNum(ReadTimeChip(blockRows[i].chipOff))) {
+                    ShowCustomTooltip("Schedule " i ": turn on and turn off cannot be the same time.", "paused", 3500)
                     return
                 }
-            } else {
-                for i, row in dayRows {
-                    if (pills[i].enabled && ReadTimeChip(row.chipOn) >= ReadTimeChip(row.chipOff)) {
-                        ShowCustomTooltip(days[i] ": Turn on time must be earlier than Turn off time.", "paused", 3500)
-                        return
-                    }
+                local any := false
+                for _, p in blockRows[i].pills
+                    if (p.enabled)
+                        any := true
+                if (!any) {
+                    ShowCustomTooltip("Schedule " i " needs at least one day selected.", "paused", 3500)
+                    return
                 }
             }
         }
-        SaveScheduleHandler(guiSchedule, rOn.radio, chkSame, pills, chipSharedOn, chipSharedOff, dayRows, days)
+        SaveScheduleHandler(guiSchedule, rOn.radio, breakRows, breakCount, blockRows, blockCount)
     }
 
     LinkRadioPair(rOff, rOn, (*) => RefreshRows(), (*) => RefreshRows())
-    chkSame.OnEvent("Click", (*) => RefreshRows())
-    RefreshRows()
 
-    guiSchedule.OnEvent("Escape", (*) => guiSchedule.Destroy())
-    guiSchedule.MarginY := 0
-    guiSchedule.MarginX := 0
-    guiSchedule.Show("AutoSize Center")
+    RefreshRows()
     isWindowShown := true
+    guiSchedule.Show("AutoSize Center")
     ApplyDarkTitleBar(guiSchedule)
 }
 
-SaveScheduleHandler(guiObj, radioOn, chkSame, pills, chipSharedOn, chipSharedOff, dayRows, days) {
+SaveScheduleHandler(guiObj, radioOn, breakRows, breakCount, blockRows, blockCount) {
     global scheduleMode, scheduleData, isPaused
-    scheduleMode := (radioOn.Value = 1) ? "scheduled" : "disabled"
-    scheduleData["SameTime"] := (chkSame.Value = 1)
-    scheduleData["SimpleOnTime"]  := ReadTimeChip(chipSharedOn)
-    scheduleData["SimpleOffTime"] := ReadTimeChip(chipSharedOff)
+    global g_manualOverride, g_overrideBaseline, MAX_BREAKS, MAX_BLOCKS
 
-    for i, day in days {
-        scheduleData[day "Enabled"] := pills[i].enabled
-        scheduleData[day "On"]  := ReadTimeChip(dayRows[i].chipOn)
-        scheduleData[day "Off"] := ReadTimeChip(dayRows[i].chipOff)
+    scheduleMode := (radioOn.Value = 1) ? "scheduled" : "disabled"
+
+    scheduleData["BreakCount"] := breakCount
+    loop MAX_BREAKS {
+        local i := A_Index
+        if (i <= breakCount) {
+            scheduleData["Break" i "Start"] := ReadTimeChip(breakRows[i].chipS)
+            scheduleData["Break" i "End"]   := ReadTimeChip(breakRows[i].chipE)
+        }
     }
+
+    scheduleData["BlockCount"] := blockCount
+    loop MAX_BLOCKS {
+        local i := A_Index
+        if (i <= blockCount) {
+            scheduleData["Block" i "On"]  := ReadTimeChip(blockRows[i].chipOn)
+            scheduleData["Block" i "Off"] := ReadTimeChip(blockRows[i].chipOff)
+            local flags := ""
+            for _, p in blockRows[i].pills
+                flags .= p.enabled ? "1" : "0"
+            scheduleData["Block" i "Days"] := flags
+        }
+    }
+
     SaveScheduleSettings()
-    UpdateTray(isPaused ? "paused" : "active")
+
+    ; Editing the schedule is an expression of intent, so any
+    ; standing manual override is cleared and the new schedule
+    ; applies now rather than up to a minute later.
+    g_manualOverride := false
+    g_overrideBaseline := ""
     guiObj.Destroy()
+    CheckSchedule()
+    UpdateTray(isPaused ? "paused" : "active")
     ShowCustomTooltip("Schedule saved.", isPaused ? "paused" : "active")
 }
 ; ===== END MODULE: SCHEDULE WINDOW ==========================
@@ -993,35 +1452,113 @@ LoadSettings() {
 
 InitializeScheduleDataDefaults() {
     global scheduleData
-    scheduleData["SameTime"]      := true
-    scheduleData["SimpleOnTime"]  := "07:00"
-    scheduleData["SimpleOffTime"] := "18:00"
-    days := ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
-    for _, day in days {
-        scheduleData[day "Enabled"] := true
-        scheduleData[day "On"]  := "07:00"
-        scheduleData[day "Off"] := "18:00"
+    ; Breaks are daily and independent of the schedule.
+    scheduleData["BreakCount"] := 0
+    loop MAX_BREAKS {
+        scheduleData["Break" A_Index "Start"] := "12:00"
+        scheduleData["Break" A_Index "End"]   := "13:00"
+    }
+    ; An hour block is a time range plus the days it applies to,
+    ; stored as 7 flags, Sunday first.
+    scheduleData["BlockCount"] := 1
+    loop MAX_BLOCKS {
+        scheduleData["Block" A_Index "On"]   := "07:00"
+        scheduleData["Block" A_Index "Off"]  := "18:00"
+        scheduleData["Block" A_Index "Days"] := "1111111"
     }
 }
 
 LoadScheduleData() {
     global scheduleData, iniFile, scheduleMode
-    if (scheduleMode = "simple") {
-        scheduleMode := "scheduled", scheduleData["SameTime"] := true
-    } else if (scheduleMode = "advanced") {
-        scheduleMode := "scheduled", scheduleData["SameTime"] := false
-    } else if (scheduleMode = "scheduled") {
-        scheduleData["SameTime"] := (IniRead(iniFile, "Schedule", "SameTime", "true") = "true")
+
+    if (scheduleMode = "simple" || scheduleMode = "advanced")
+        scheduleMode := "scheduled"
+
+    ; A BlockCount key means this INI is already in the new format.
+    local hasNew := (IniRead(iniFile, "Schedule", "BlockCount", "") != "")
+
+    if (hasNew) {
+        scheduleData["BreakCount"] := Integer(IniRead(iniFile, "Schedule", "BreakCount", 0))
+        loop MAX_BREAKS {
+            scheduleData["Break" A_Index "Start"] := IniRead(iniFile, "Schedule", "Break" A_Index "Start", "12:00")
+            scheduleData["Break" A_Index "End"]   := IniRead(iniFile, "Schedule", "Break" A_Index "End", "13:00")
+        }
+        scheduleData["BlockCount"] := Integer(IniRead(iniFile, "Schedule", "BlockCount", 1))
+        loop MAX_BLOCKS {
+            scheduleData["Block" A_Index "On"]   := IniRead(iniFile, "Schedule", "Block" A_Index "On", "07:00")
+            scheduleData["Block" A_Index "Off"]  := IniRead(iniFile, "Schedule", "Block" A_Index "Off", "18:00")
+            scheduleData["Block" A_Index "Days"] := IniRead(iniFile, "Schedule", "Block" A_Index "Days", "1111111")
+        }
+        return
     }
 
-    scheduleData["SimpleOnTime"]  := IniRead(iniFile, "Schedule", "SimpleOnTime", "07:00")
-    scheduleData["SimpleOffTime"] := IniRead(iniFile, "Schedule", "SimpleOffTime", "18:00")
-    days := ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
-    for _, day in days {
-        scheduleData[day "Enabled"] := (IniRead(iniFile, "Schedule", day "Enabled", "true") = "true")
-        scheduleData[day "On"]  := IniRead(iniFile, "Schedule", day "On", "07:00")
-        scheduleData[day "Off"] := IniRead(iniFile, "Schedule", day "Off", "18:00")
+    MigrateOldSchedule()
+}
+
+; Converts a pre-blocks INI. The single break becomes break 1;
+; per-day times are grouped by identical on/off pair, so someone
+; with weekday and weekend hours lands on two blocks rather than
+; seven near-duplicates.
+MigrateOldSchedule() {
+    global scheduleData, iniFile
+
+    if (IniRead(iniFile, "Schedule", "BreakEnabled", "false") = "true") {
+        scheduleData["BreakCount"]   := 1
+        scheduleData["Break1Start"]  := IniRead(iniFile, "Schedule", "BreakStart", "12:00")
+        scheduleData["Break1End"]    := IniRead(iniFile, "Schedule", "BreakEnd", "13:00")
+    } else {
+        scheduleData["BreakCount"] := 0
     }
+
+    local days := ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
+    local sameTime := (IniRead(iniFile, "Schedule", "SameTime", "true") = "true")
+
+    local flags := ""
+    for _, day in days
+        flags .= (IniRead(iniFile, "Schedule", day "Enabled", "true") = "true") ? "1" : "0"
+
+    if (sameTime) {
+        scheduleData["BlockCount"]  := 1
+        scheduleData["Block1On"]    := IniRead(iniFile, "Schedule", "SimpleOnTime", "07:00")
+        scheduleData["Block1Off"]   := IniRead(iniFile, "Schedule", "SimpleOffTime", "18:00")
+        scheduleData["Block1Days"]  := (flags = "0000000") ? "1111111" : flags
+        return
+    }
+
+    ; Group enabled days by their on/off pair.
+    local groups := Map(), order := []
+    for i, day in days {
+        if (SubStr(flags, i, 1) != "1")
+            continue
+        local on  := IniRead(iniFile, "Schedule", day "On", "07:00")
+        local off := IniRead(iniFile, "Schedule", day "Off", "18:00")
+        local key := on "|" off
+        if (!groups.Has(key)) {
+            groups[key] := ["0","0","0","0","0","0","0"]
+            order.Push(key)
+        }
+        groups[key][i] := "1"
+    }
+
+    if (order.Length = 0) {
+        scheduleData["BlockCount"] := 1
+        return
+    }
+
+    local n := 0
+    for _, key in order {
+        if (n >= MAX_BLOCKS)
+            break
+        n++
+        local parts := StrSplit(key, "|")
+        scheduleData["Block" n "On"]   := parts[1]
+        scheduleData["Block" n "Off"]  := parts[2]
+        local s := ""
+        for _, f in groups[key]
+            s .= f
+        scheduleData["Block" n "Days"] := s
+    }
+    scheduleData["BlockCount"] := n
 }
 
 SaveSettingsToFile(minutes, method) {
@@ -1044,39 +1581,80 @@ SaveCustomCodeSettings(enabled) {
 SaveScheduleSettings() {
     global iniFile, scheduleMode, scheduleData
     IniWrite(scheduleMode, iniFile, "Schedule", "Mode")
-    IniWrite(scheduleData.Get("SameTime", true) ? "true" : "false", iniFile, "Schedule", "SameTime")
-    IniWrite(scheduleData.Get("SimpleOnTime", "07:00"), iniFile, "Schedule", "SimpleOnTime")
-    IniWrite(scheduleData.Get("SimpleOffTime", "18:00"), iniFile, "Schedule", "SimpleOffTime")
-    days := ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
-    for _, day in days {
-        IniWrite(scheduleData.Get(day "Enabled", true) ? "true" : "false", iniFile, "Schedule", day "Enabled")
-        IniWrite(scheduleData.Get(day "On", "07:00"),  iniFile, "Schedule", day "On")
-        IniWrite(scheduleData.Get(day "Off", "18:00"), iniFile, "Schedule", day "Off")
+
+    IniWrite(scheduleData.Get("BreakCount", 0), iniFile, "Schedule", "BreakCount")
+    loop MAX_BREAKS {
+        IniWrite(scheduleData.Get("Break" A_Index "Start", "12:00"), iniFile, "Schedule", "Break" A_Index "Start")
+        IniWrite(scheduleData.Get("Break" A_Index "End", "13:00"),   iniFile, "Schedule", "Break" A_Index "End")
+    }
+
+    IniWrite(scheduleData.Get("BlockCount", 1), iniFile, "Schedule", "BlockCount")
+    loop MAX_BLOCKS {
+        IniWrite(scheduleData.Get("Block" A_Index "On", "07:00"),    iniFile, "Schedule", "Block" A_Index "On")
+        IniWrite(scheduleData.Get("Block" A_Index "Off", "18:00"),   iniFile, "Schedule", "Block" A_Index "Off")
+        IniWrite(scheduleData.Get("Block" A_Index "Days", "1111111"), iniFile, "Schedule", "Block" A_Index "Days")
     }
 }
+
 ; ===== END MODULE: SETTINGS PERSISTENCE =====================
 
 
 ; ===== MODULE: TRAY ACTIONS & POWER =========================
-PauseActivity(*) {
-    global isPaused
-    if (isPaused)
+; Single point where prevention actually changes state.
+; source records WHO asked: "user", "break" or "schedule".
+ApplyPreventionState(wantActive, source, quiet := false) {
+    global isPaused, g_pauseReason
+
+    if (wantActive) {
+        if (!isPaused) {
+            g_pauseReason := "none"
+            UpdateTray("active")
+            return
+        }
+        isPaused := false
+        g_pauseReason := "none"
+        StartIntelligentTimers()
+        RefreshPowerState()
+        if (!quiet)
+            try ShowCustomTooltip("StayAwake prevention active. Your computer won't go to sleep.", "active")
+        UpdateTray("active")
         return
+    }
+
+    if (isPaused) {
+        g_pauseReason := source
+        UpdateTray("paused")
+        return
+    }
     isPaused := true
+    g_pauseReason := source
     StopIntelligentTimers()
     RefreshPowerState()
-    try ShowCustomTooltip("StayAwake prevention paused.", "paused")
+    if (!quiet) {
+        ; Braces are required here: a bare "try" owns any "else"
+        ; that follows it (try/catch/else), so without them the
+        ; else binds to the try instead of the if.
+        local msg := (source = "break")
+            ? "Break started. StayAwake paused."
+            : "StayAwake prevention paused."
+        try ShowCustomTooltip(msg, "paused")
+    }
     UpdateTray("paused")
 }
+
+; Tray actions. A manual choice takes effect at once and holds
+; until the schedule's intent changes -- see CheckSchedule.
+PauseActivity(*) {
+    global g_manualOverride, g_overrideBaseline
+    g_manualOverride := true
+    g_overrideBaseline := ComputeScheduleIntent()
+    ApplyPreventionState(false, "user")
+}
 ResumeActivity(*) {
-    global isPaused
-    if (!isPaused)
-        return
-    isPaused := false
-    StartIntelligentTimers()
-    RefreshPowerState()
-    try ShowCustomTooltip("StayAwake prevention active. Your computer won't go to sleep.", "active")
-    UpdateTray("active")
+    global g_manualOverride, g_overrideBaseline
+    g_manualOverride := true
+    g_overrideBaseline := ComputeScheduleIntent()
+    ApplyPreventionState(true, "user")
 }
 UpdateTray(state) {
     global g_IconPaused, g_IconActive
@@ -1389,6 +1967,7 @@ OnExit(HandleAppExit)
 ; Register the Lock Screen session listener
 DllCall("wtsapi32\WTSRegisterSessionNotification", "Ptr", A_ScriptHwnd, "UInt", 0)
 OnMessage(0x02B1, WM_WTSSESSION_CHANGE)
+OnMessage(0x0218, WM_POWERBROADCAST)
 
 UpdateTray(isPaused ? "paused" : "active")
 A_IconHidden := false
@@ -1407,35 +1986,95 @@ if (customCodeEnabled)
 
 
 ; ===== MODULE: SCHEDULE ENGINE ==============================
+; What the schedule wants right now, independent of the current
+; state. Returning a single token makes "has the schedule reached
+; its next transition?" a simple string comparison, which is what
+; a manual override is measured against.
+;   "break"  inside a break window
+;   "active" inside scheduled hours
+;   "off"    outside scheduled hours
+;   "free"   no schedule and no break -- the schedule has no opinion
+ComputeScheduleIntent() {
+    global scheduleMode, scheduleData, startupDefaultActive, g_activeBreakEnd
+
+    local curNum := TimeToNum(FormatTime(, "HH:mm"))
+    local tIdx := A_WDay                          ; 1 = Sunday
+    local yIdx := (A_WDay = 1) ? 7 : A_WDay - 1
+
+    ; Breaks are daily and win over everything. Each handles its
+    ; own midnight wrap, so 23:30-00:30 works like any other.
+    loop scheduleData.Get("BreakCount", 0) {
+        local bs := scheduleData.Get("Break" A_Index "Start", "12:00")
+        local be := scheduleData.Get("Break" A_Index "End", "13:00")
+        if (IsTimeInRange(FormatTime(, "HH:mm"), bs, be)) {
+            g_activeBreakEnd := be
+            return "break"
+        }
+    }
+    g_activeBreakEnd := ""
+
+    if (scheduleMode == "disabled")
+        return "free"
+
+    local blockCount := scheduleData.Get("BlockCount", 1)
+    local todayIsScheduled := false
+
+    loop blockCount {
+        local on   := scheduleData.Get("Block" A_Index "On", "07:00")
+        local off  := scheduleData.Get("Block" A_Index "Off", "18:00")
+        local days := scheduleData.Get("Block" A_Index "Days", "1111111")
+
+        if (SubStr(days, tIdx, 1) = "1") {
+            todayIsScheduled := true
+            if (WindowCovers(on, off, curNum, false))
+                return "active"
+        }
+        ; A wrapped block belongs to the day it started on, so
+        ; yesterday's tail still counts even if today is not in it.
+        if (SubStr(days, yIdx, 1) = "1" && WindowCovers(on, off, curNum, true))
+            return "active"
+    }
+
+    ; A day in no block at all is not scheduled, so it follows the
+    ; launch behavior setting rather than being forced off.
+    if (!todayIsScheduled)
+        return startupDefaultActive ? "active" : "off"
+
+    return "off"
+}
+
 CheckSchedule() {
-    global scheduleMode, scheduleData, isPaused, startupDefaultActive
+    global g_manualOverride, g_overrideBaseline, g_preBreakActive, isPaused
+    static prevIntent := ""
 
-    if (scheduleMode = "disabled")
-        return
+    local intent := ComputeScheduleIntent()
+    local wasIntent := prevIntent
+    prevIntent := intent
 
-    currentTime := FormatTime(, "HH:mm")
-    currentDay  := FormatTime(, "dddd")
-    desiredActive := false
+    ; Remember the state going into a break so it can be put back
+    ; afterwards. Without this, a break that ends would blindly
+    ; resume prevention the user had switched off themselves.
+    if (intent = "break" && wasIntent != "break")
+        g_preBreakActive := !isPaused
 
-    if (!scheduleData.Get(currentDay "Enabled", true)) {
-        desiredActive := startupDefaultActive
-    } else if (scheduleData.Get("SameTime", true)) {
-        desiredActive := IsTimeInRange(currentTime, scheduleData.Get("SimpleOnTime", "07:00"), scheduleData.Get("SimpleOffTime", "18:00"))
-    } else {
-        desiredActive := IsTimeInRange(currentTime, scheduleData.Get(currentDay "On", "07:00"), scheduleData.Get(currentDay "Off", "18:00"))
+    ; A manual choice holds until the schedule reaches its next
+    ; transition, then the schedule takes control back. This is
+    ; what stops the 60-second tick from undoing a manual pause.
+    if (g_manualOverride) {
+        if (intent = g_overrideBaseline)
+            return
+        g_manualOverride := false
+        g_overrideBaseline := ""
     }
 
-    if (desiredActive && isPaused) {
-        isPaused := false
-        StartIntelligentTimers()
-        RefreshPowerState()
-        UpdateTray("active")
-    } else if (!desiredActive && !isPaused) {
-        isPaused := true
-        StopIntelligentTimers()
-        RefreshPowerState()
-        UpdateTray("paused")
-    }
+    if (intent = "break")
+        ApplyPreventionState(false, "break")
+    else if (intent = "active")
+        ApplyPreventionState(true, "schedule")
+    else if (intent = "off")
+        ApplyPreventionState(false, "schedule")
+    else if (wasIntent = "break")
+        ApplyPreventionState(g_preBreakActive, "schedule")   ; break over, no schedule: restore
 }
 SetTimer(CheckSchedule, 60000)
 CheckSchedule()
